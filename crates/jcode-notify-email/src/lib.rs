@@ -177,17 +177,24 @@ pub fn parse_permission_reply(text: &str) -> (bool, Option<String>) {
         .filter(|token| !token.is_empty())
         .collect();
 
-    let approve_words = ["approve", "approved", "yes", "lgtm", "ok", "sure"];
     let deny_words = [
         "deny", "denied", "no", "reject", "rejected", "stop", "nope", "not", "never",
     ];
-    let has_approve = tokens
-        .first()
-        .is_some_and(|token| approve_words.contains(&token.as_str()))
+    let has_approve = tokens.first().is_some_and(|token| is_approval_token(token))
         || tokens
             .first()
             .zip(tokens.get(1))
-            .is_some_and(|(first, second)| first == "go" && second == "ahead");
+            .is_some_and(|(first, second)| {
+                (first == "go" && second == "ahead")
+                    || ((first == "please" || first == "i") && is_approval_token(second))
+            })
+        || tokens
+            .first()
+            .zip(tokens.get(1))
+            .zip(tokens.get(2))
+            .is_some_and(|((first, second), third)| {
+                first == "i" && second == "have" && third == "approved"
+            });
     let has_deny = tokens
         .iter()
         .any(|token| deny_words.contains(&token.as_str()))
@@ -351,6 +358,13 @@ pub fn build_permission_email_html(
 </div>
 </body>
 </html>"#
+    )
+}
+
+fn is_approval_token(token: &str) -> bool {
+    matches!(
+        token,
+        "approve" | "approved" | "yes" | "lgtm" | "ok" | "sure"
     )
 }
 
@@ -607,6 +621,15 @@ mod tests {
         ] {
             let (approved, _) = parse_permission_reply(text);
             assert!(!approved, "must not approve ambiguous reply: {text}");
+        }
+
+        for text in [
+            "Please approve this",
+            "I approve this",
+            "I have approved this",
+        ] {
+            let (approved, _) = parse_permission_reply(text);
+            assert!(approved, "must preserve clear affirmative reply: {text}");
         }
     }
 
