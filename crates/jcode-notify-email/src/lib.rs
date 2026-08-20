@@ -62,7 +62,13 @@ pub async fn send_email(request: SendEmailRequest<'_>) -> Result<()> {
     Ok(())
 }
 
-pub fn poll_imap_once(host: &str, port: u16, user: &str, pass: &str) -> Result<Vec<ReplyAction>> {
+pub fn poll_imap_once(
+    host: &str,
+    port: u16,
+    user: &str,
+    pass: &str,
+    allowed_sender: &str,
+) -> Result<Vec<ReplyAction>> {
     let client = imap::ClientBuilder::new(host, port).connect()?;
     let mut session = client
         .login(user, pass)
@@ -94,6 +100,10 @@ pub fn poll_imap_once(host: &str, port: u16, user: &str, pass: &str) -> Result<V
         if let Some(body) = message.body()
             && let Some(parsed) = mail_parser::MessageParser::default().parse(body)
         {
+            if !message_from_matches(&parsed, allowed_sender) {
+                continue;
+            }
+
             let in_reply_to = parsed.in_reply_to().as_text().unwrap_or("").to_string();
             let subject = parsed.subject().unwrap_or("");
 
@@ -156,16 +166,34 @@ pub fn extract_permission_id(text: &str) -> Option<String> {
 }
 
 pub fn parse_permission_reply(text: &str) -> (bool, Option<String>) {
-    let lower = text.to_lowercase();
-    let first_line = lower.lines().next().unwrap_or("").trim();
+    let first_line = text.lines().next().unwrap_or("").trim();
+    let tokens: Vec<String> = first_line
+        .split_whitespace()
+        .map(|token| {
+            token
+                .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '\'')
+                .to_ascii_lowercase()
+        })
+        .filter(|token| !token.is_empty())
+        .collect();
 
-    let approve_words = [
-        "approve", "approved", "yes", "lgtm", "go ahead", "ok", "sure",
+    let approve_words = ["approve", "approved", "yes", "lgtm", "ok", "sure"];
+    let deny_words = [
+        "deny", "denied", "no", "reject", "rejected", "stop", "nope", "not", "never",
     ];
-    let deny_words = ["deny", "denied", "no", "reject", "rejected", "stop", "nope"];
-
-    let has_approve = approve_words.iter().any(|w| first_line.contains(w));
-    let has_deny = deny_words.iter().any(|w| first_line.contains(w));
+    let has_approve = tokens
+        .first()
+        .is_some_and(|token| approve_words.contains(&token.as_str()))
+        || tokens
+            .first()
+            .zip(tokens.get(1))
+            .is_some_and(|(first, second)| first == "go" && second == "ahead");
+    let has_deny = tokens
+        .iter()
+        .any(|token| deny_words.contains(&token.as_str()))
+        || tokens
+            .iter()
+            .any(|token| token == "don't" || token == "dont");
     let approved = has_approve && !has_deny;
 
     let message = if text.trim().len() > 20 {
@@ -183,6 +211,9 @@ pub fn build_permission_email_html(
     request_id: &str,
     reply_to: &str,
 ) -> String {
+    let escaped_action = escape_html(action);
+    let escaped_description = escape_html(description);
+    let escaped_request_id = escape_html(request_id);
     let now = chrono::Utc::now();
     let timestamp = now.format("%Y-%m-%d %H:%M:%S UTC").to_string();
 
@@ -297,15 +328,15 @@ pub fn build_permission_email_html(
   <h1>Permission Request</h1>
   <div class="field">
     <div class="field-label">Action</div>
-    <div class="field-value"><strong>{action}</strong></div>
+    <div class="field-value"><strong>{escaped_action}</strong></div>
   </div>
   <div class="field">
     <div class="field-label">Description</div>
-    <div class="field-value">{description}</div>
+    <div class="field-value">{escaped_description}</div>
   </div>
   <div class="field">
     <div class="field-label">Request ID</div>
-    <div class="field-value"><span class="request-id">{request_id}</span></div>
+    <div class="field-value"><span class="request-id">{escaped_request_id}</span></div>
   </div>
   <div class="buttons">
     <a href="{approve_href}" class="btn btn-approve">Approve</a>
@@ -321,6 +352,67 @@ pub fn build_permission_email_html(
 </body>
 </html>"#
     )
+}
+
+fn message_from_matches(message: &mail_parser::Message<'_>, allowed_sender: &str) -> bool {
+    let allowed_sender = normalize_email_address(allowed_sender);
+    if allowed_sender.is_empty() {
+        return false;
+    }
+
+    message
+        .header_as(
+            mail_parser::HeaderName::From,
+            mail_parser::HeaderForm::Addresses,
+        )
+        .into_iter()
+        .any(|value| match value {
+            mail_parser::HeaderValue::Address(mail_parser::Address::List(addresses)) => {
+                addresses.iter().any(|address| {
+                    address
+                        .address
+                        .as_deref()
+                        .is_some_and(|value| normalize_email_address(value) == allowed_sender)
+                })
+            }
+            mail_parser::HeaderValue::Address(mail_parser::Address::Group(groups)) => groups
+                .iter()
+                .flat_map(|group| group.addresses.iter())
+                .any(|address| {
+                    address
+                        .address
+                        .as_deref()
+                        .is_some_and(|value| normalize_email_address(value) == allowed_sender)
+                }),
+            _ => false,
+        })
+}
+
+fn normalize_email_address(raw: &str) -> String {
+    let raw = raw.trim();
+    let address = raw
+        .rsplit_once('<')
+        .and_then(|(_, value)| value.split('>').next())
+        .unwrap_or(raw)
+        .trim();
+    address
+        .trim_matches(|c: char| c == '<' || c == '>')
+        .to_ascii_lowercase()
+}
+
+fn escape_html(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 fn markdown_to_html_email(markdown: &str) -> String {
@@ -506,6 +598,19 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_permission_reply_rejects_negated_or_embedded_approval() {
+        for text in [
+            "I have not approved this",
+            "I don't approve this",
+            "not sure",
+            "the word approved appears here",
+        ] {
+            let (approved, _) = parse_permission_reply(text);
+            assert!(!approved, "must not approve ambiguous reply: {text}");
+        }
+    }
+
+    #[test]
     fn test_extract_permission_id() {
         assert_eq!(
             extract_permission_id("approve req_123"),
@@ -525,5 +630,36 @@ mod tests {
         assert!(html.contains("Permission Request"));
         assert!(html.contains("req_123"));
         assert!(html.contains("mailto:jcode@example.com"));
+    }
+
+    #[test]
+    fn test_build_permission_email_html_escapes_request_fields() {
+        let html = build_permission_email_html(
+            "<img src=x onerror=alert(1)>",
+            "</div><a href=\"https://evil.example\">Click me</a>",
+            "req_123<svg/onload=alert(1)>",
+            "jcode@example.com",
+        );
+        assert!(html.contains("&lt;img src=x onerror=alert(1)&gt;"));
+        assert!(html.contains("&lt;/div&gt;&lt;a href=&quot;https://evil.example&quot;&gt;"));
+        assert!(html.contains("req_123&lt;svg/onload=alert(1)&gt;"));
+        assert!(!html.contains("<img src=x onerror=alert(1)>"));
+        assert!(!html.contains("</div><a href=\"https://evil.example\">"));
+    }
+
+    #[test]
+    fn test_message_from_matches_configured_sender() {
+        let message = mail_parser::MessageParser::default()
+            .parse(
+                br"From: Human User <human@example.com>\r
+To: jcode@example.com\r
+Subject: Re: ambient\r
+\r
+Approved\r
+",
+            )
+            .expect("valid message");
+        assert!(message_from_matches(&message, "human@example.com"));
+        assert!(!message_from_matches(&message, "attacker@example.com"));
     }
 }

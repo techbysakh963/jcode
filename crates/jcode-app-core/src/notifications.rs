@@ -791,6 +791,13 @@ pub async fn imap_reply_loop(config: SafetyConfig) {
             return;
         }
     };
+    let allowed_sender = match config.email_to.as_ref() {
+        Some(sender) if !sender.trim().is_empty() => sender.clone(),
+        _ => {
+            logging::error("IMAP reply loop: no authorized reply sender configured");
+            return;
+        }
+    };
 
     logging::info(&format!(
         "IMAP reply loop: starting ({}:{}, user: {})",
@@ -802,8 +809,9 @@ pub async fn imap_reply_loop(config: SafetyConfig) {
         let h = host.clone();
         let u = user.clone();
         let p = pass.clone();
+        let s = allowed_sender.clone();
         let pt = port;
-        let result = tokio::task::spawn_blocking(move || poll_imap_once(&h, pt, &u, &p)).await;
+        let result = tokio::task::spawn_blocking(move || poll_imap_once(&h, pt, &u, &p, &s)).await;
 
         match result {
             Ok(Ok(actions)) => {
